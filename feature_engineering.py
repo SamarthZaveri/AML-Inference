@@ -55,14 +55,12 @@ def load_data(filepath: str) -> pd.DataFrame:
     print("─" * 55)
     print("STEP 1 — Loading data")
     print("─" * 55)
-    chunks = []
-    for i, chunk in enumerate(pd.read_csv(filepath, chunksize=CHUNK_SIZE)):
-        chunk["Timestamp"] = pd.to_datetime(chunk["Timestamp"])
-        chunks.append(chunk)
-        print(f"  chunk {i+1} — {sum(len(c) for c in chunks):,} rows")
-    df = pd.concat(chunks, ignore_index=True)
 
-    # Shared flags — computed once, reused everywhere
+    t0 = time.time()
+    df = pd.read_csv(filepath, engine="pyarrow")
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+    print(f"  load time    : {time.time()-t0:.1f}s — {len(df):,} rows")
+
     df["currency_switched"] = (
         df["Payment Currency"] != df["Receiving Currency"]
     ).astype(np.int8)
@@ -71,7 +69,6 @@ def load_data(filepath: str) -> pd.DataFrame:
     ).astype(np.int8)
     df["is_weekend"] = df["Timestamp"].dt.dayofweek.isin([5, 6]).astype(np.int8)
 
-    # Encode entity type once
     def encode_entity(name):
         if pd.isna(name):
             return 4

@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 import shutil
 import uuid
@@ -15,6 +16,18 @@ BASE_DIR = Path("./runs")
 BASE_DIR.mkdir(exist_ok=True)
 
 PYTHON = sys.executable
+
+# ── Windows fix ──────────────────────────────────────────────────────────
+# By default, a subprocess.Popen child on Windows shares the parent's
+# console process group. That means a Ctrl+C (or a reload/restart signal)
+# sent to the server console gets broadcast to every child process too —
+# including the pipeline subprocess — killing it with a KeyboardInterrupt
+# even though nobody touched the keyboard for that child directly.
+# CREATE_NEW_PROCESS_GROUP isolates the child from that signal group.
+if sys.platform == "win32":
+    POPEN_CREATIONFLAGS = subprocess.CREATE_NEW_PROCESS_GROUP
+else:
+    POPEN_CREATIONFLAGS = 0
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -41,7 +54,6 @@ async def upload_csv(file: UploadFile = File(...)):
 
     input_path = input_dir / file.filename
 
-    # save file
     with open(input_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
@@ -49,29 +61,20 @@ async def upload_csv(file: UploadFile = File(...)):
     status_file = run_dir / ".status.json"
 
     cmd = [
-        PYTHON,
-        "-u",
+        PYTHON, "-u",
         str(Path(__file__).parent / "pipeline.py"),
-        "--input",
-        str(input_path.resolve()),
-        "--output",
-        str(output_dir.resolve()),
+        "--input", str(input_path.resolve()),
+        "--output", str(output_dir.resolve()),
     ]
 
     logfh = open(logfile, "ab")
-
     proc = subprocess.Popen(
-        cmd,
-        stdout=logfh,
-        stderr=subprocess.STDOUT,
-        cwd=str(Path(__file__).parent)
+        cmd, stdout=logfh, stderr=subprocess.STDOUT,
+        cwd=str(Path(__file__).parent),
+        creationflags=POPEN_CREATIONFLAGS,
     )
 
-    status = {
-        "pid": proc.pid,
-        "status": "running",
-        "started_at": time.time(),
-    }
+    status = {"pid": proc.pid, "status": "running", "started_at": time.time()}
     status_file.write_text(json.dumps(status))
 
     return {
@@ -85,40 +88,76 @@ async def upload_csv(file: UploadFile = File(...)):
 # 📊 STATUS ENDPOINT
 @app.get("/status/{run_id}")
 def status(run_id: str):
+
     run_dir = BASE_DIR / run_id
+
     if not run_dir.exists():
-        raise HTTPException(status_code=404, detail="run_id not found")
+        raise HTTPException(
+            status_code=404,
+            detail="run_id not found"
+        )
 
     status_file = run_dir / ".status.json"
-    logfile = run_dir / "pipeline.log"
-    output_dir = run_dir / "output"
+    output_dir  = run_dir / "output"
 
     status = {}
+
     if status_file.exists():
         status = json.loads(status_file.read_text())
 
     pid = status.get("pid")
+
     alive = _is_pid_alive(pid) if pid else False
 
-    # 🔥 Detect completion properly
-    if pid and not alive:
+    # ─────────────────────────────────────────────
+    # SUCCESS DETECTION
+    # ─────────────────────────────────────────────
+
+    vis_dir = output_dir / "visualisation"
+
+    predictions_ok = (
+        output_dir / "predictions.csv"
+    ).exists()
+
+    vis_ok = (
+        vis_dir.exists()
+        and any(vis_dir.glob("subgraph_*.json"))
+    )
+
+    if predictions_ok and vis_ok:
+
+        status["status"] = "success"
+
         if "finished_at" not in status:
-            # check if predictions exist → success
-            if (output_dir / "predictions.csv").exists():
-                status["status"] = "success"
-            else:
-                status["status"] = "failed"
-
             status["finished_at"] = time.time()
-            status_file.write_text(json.dumps(status))
 
-    # Artefacts
+            status_file.write_text(
+                json.dumps(status)
+            )
+
+    # ─────────────────────────────────────────────
+    # FAILURE DETECTION
+    # ─────────────────────────────────────────────
+
+    elif pid and not alive:
+
+        status["status"] = "failed"
+
+        if "finished_at" not in status:
+            status["finished_at"] = time.time()
+
+            status_file.write_text(
+                json.dumps(status)
+            )
+
     artefacts = {}
+
     for name, path in {
         "predictions": output_dir / "predictions.csv",
         "graph": output_dir / "graph",
         "visualisation": output_dir / "visualisation",
     }.items():
+
         if path.exists():
             artefacts[name] = str(path.resolve())
 
@@ -126,57 +165,85 @@ def status(run_id: str):
         "run_id": run_id,
         "status": status.get("status"),
         "alive": alive,
-        "artefacts": artefacts
+        "artefacts": artefacts,
     }
 
 
-# 📜 LOG STREAM (VERY USEFUL)
+# 📜 LOGS
 @app.get("/logs/{run_id}")
 def get_logs(run_id: str):
     logfile = BASE_DIR / run_id / "pipeline.log"
     if not logfile.exists():
         raise HTTPException(status_code=404, detail="Log not found")
-
     with open(logfile, "r", errors="ignore") as f:
-        lines = f.readlines()[-200:]  # last 200 lines
-
+        lines = f.readlines()[-200:]
     return {"logs": lines}
 
 
-# 📥 DOWNLOAD RESULTS
+# 📥 DOWNLOAD PREDICTIONS
 @app.get("/download/{run_id}")
 def download_predictions(run_id: str):
     file = BASE_DIR / run_id / "output" / "predictions.csv"
-
     if not file.exists():
         raise HTTPException(status_code=404, detail="Predictions not ready")
-
     return FileResponse(file, filename="predictions.csv")
 
 
-# ❌ OPTIONAL: KILL JOB
+# 🗺 SERVE SUBGRAPH JSON  (critical for frontend graph rendering)
+@app.get("/visualisation/{run_id}/subgraph_{seed_id}.json")
+def get_subgraph_json(run_id: str, seed_id: str):
+    f = BASE_DIR / run_id / "output" / "visualisation" / f"subgraph_{seed_id}.json"
+    if not f.exists():
+        raise HTTPException(status_code=404, detail=f"subgraph_{seed_id}.json not found")
+    return FileResponse(f, media_type="application/json")
+
+
+# 🖼 SERVE SUBGRAPH PNG
+@app.get("/visualisation/{run_id}/subgraph_{seed_id}.png")
+def get_subgraph_png(run_id: str, seed_id: str):
+    f = BASE_DIR / run_id / "output" / "visualisation" / f"subgraph_{seed_id}.png"
+    if not f.exists():
+        raise HTTPException(status_code=404, detail=f"subgraph_{seed_id}.png not found")
+    return FileResponse(f, media_type="image/png")
+
+
+# 📋 VISUALISATION INDEX
+@app.get("/visualisation/{run_id}/index.json")
+def get_vis_index(run_id: str):
+    f = BASE_DIR / run_id / "output" / "visualisation" / "index.json"
+    if not f.exists():
+        raise HTTPException(status_code=404, detail="index.json not found")
+    return FileResponse(f, media_type="application/json")
+
+
+# ❌ KILL JOB
 @app.post("/kill/{run_id}")
 def kill_job(run_id: str):
     status_file = BASE_DIR / run_id / ".status.json"
     if not status_file.exists():
         raise HTTPException(status_code=404, detail="run not found")
-
     status = json.loads(status_file.read_text())
     pid = status.get("pid")
-
     if pid and _is_pid_alive(pid):
         os.kill(pid, 9)
         status["status"] = "killed"
         status_file.write_text(json.dumps(status))
         return {"message": "killed"}
-
     return {"message": "already stopped"}
 
 
-# 🖥️ DASHBOARD — serves index.html at /dashboard
+# 🖥 DASHBOARD
 @app.get("/dashboard")
 def serve_dashboard():
     dashboard_path = Path(__file__).parent / "index.html"
     if not dashboard_path.exists():
-        raise HTTPException(status_code=404, detail="index.html not found next to app.py")
+        raise HTTPException(status_code=404, detail="index.html not found")
     return FileResponse(str(dashboard_path))
+
+
+# Serve runs directory for direct file access (fallback)
+# Mount this last so it doesn't override API routes
+try:
+    app.mount("/runs", StaticFiles(directory="runs"), name="runs")
+except Exception:
+    pass  # runs dir may not exist yet at startup

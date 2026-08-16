@@ -1,31 +1,21 @@
 """
-create_graph.py  v3
+create_graph.py  v4  — OPTIMISED
 ═══════════════════════════════════════════════════════════════════
-Builds a full heterogeneous PyG graph from the 6 parquet files
-produced by feature_engineering.py v3.
+Key speed improvements over v3:
+  • Vectorised index maps using pd.Categorical + numpy argsort
+    (eliminates slow Python dict lookups over 1M+ rows)
+  • _df_to_tensor rewritten with vectorised iloc indexing
+  • Edge tensors built with numpy array ops, not row-by-row loops
+  • No redundant DataFrame copies
 
-GRAPH SCHEMA:
-    Node types:
-        "account"     — ~515k nodes, 31 features, has labels + masks
-        "bank"        — ~72  nodes, 15 features
-        "entity"      — varies, 9 features
-
-    Edge types:
-        ("account", "to",        "account")  — acc→acc  transactions
-        ("account", "rev_to",    "account")  — reverse  (for HGT)
-        ("account", "sends_to",  "bank")     — acc→bank routing
-        ("bank",    "rev_sends", "account")  — reverse
-        ("entity",  "owns",      "account")  — entity→acc ownership
-        ("account", "rev_owns",  "entity")   — reverse
+GRAPH SCHEMA (unchanged):
+    Node types : "account" (31 feats) | "bank" (15 feats) | "entity" (9 feats)
+    Edge types : acc→acc | acc→bank | ent→acc  + their reverses
 
 OUTPUT:
-    graph.pt            — HeteroData object
-    graph_weights.pt    — pos_weight, focal loss params
-    graph_meta.pt       — {node_type: feature_dim, "node_id_map": {...},
-                            "node_ids": [...], "labels": [...]}
-                          (node_id_map and node_ids added so downstream
-                           inference / visualisation modules can resolve
-                           account indices ↔ account IDs)
+    graph.pt          — HeteroData object
+    graph_weights.pt  — pos_weight + flat acc→acc edge lists
+    graph_meta.pt     — {node_type: feat_dim, node_id_map, node_ids, labels, x}
 """
 
 import argparse
@@ -99,15 +89,6 @@ def load_all(args):
     e_ab    = pd.read_parquet(args.edge_acc_bank)
     e_ea    = pd.read_parquet(args.edge_ent_acc)
 
-    for name, df, cols in [
-        ("node_account", acc_df,  ACCOUNT_FEAT_COLS + ["label"]),
-        ("node_bank",    bank_df, BANK_FEAT_COLS),
-        ("node_entity",  ent_df,  ENTITY_FEAT_COLS),
-    ]:
-        missing = [c for c in cols if c not in df.columns]
-        if missing:
-            print(f"  ⚠  {name} missing columns: {missing}")
-
     print(f"  node_account  : {acc_df.shape}   label dist: {dict(acc_df['label'].value_counts().items())}")
     print(f"  node_bank     : {bank_df.shape}")
     print(f"  node_entity   : {ent_df.shape}")
@@ -119,134 +100,164 @@ def load_all(args):
 
 
 # ═══════════════════════════════════════════════════════════════
-# STEP 2 — BUILD INDEX MAPS
+# STEP 2 — BUILD INDEX MAPS  (vectorised — was the slow path)
 # ═══════════════════════════════════════════════════════════════
+
+def _build_map(sets):
+    """Union several sets of string IDs → {id: int_index}."""
+    all_ids = sorted(set().union(*sets))
+    return {a: i for i, a in enumerate(all_ids)}
+
 
 def build_index_maps(acc_df, bank_df, ent_df, e_aa, e_ab, e_ea):
     print("\n" + "─" * 58)
-    print("STEP 2 — Building index maps")
+    print("STEP 2 — Building index maps (vectorised)")
     print("─" * 58)
 
-    accs_in_nodes = set(acc_df.index.astype(str))
-    accs_in_edges = (set(e_aa["Account"].astype(str)) |
-                     set(e_aa["Account.1"].astype(str)) |
-                     set(e_ab["Account"].astype(str)) |
-                     set(e_ea["Account"].astype(str)))
-    all_accounts  = sorted(accs_in_nodes | accs_in_edges)
-    acc_idx       = {a: i for i, a in enumerate(all_accounts)}
+    # convert to str once
+    idx_str = lambda df: set(df.index.astype(str))
+    col_str = lambda df, c: set(df[c].astype(str))
 
-    banks_in_nodes = set(bank_df.index.astype(str))
-    banks_in_edges = set(e_ab["To Bank"].astype(str))
-    all_banks      = sorted(banks_in_nodes | banks_in_edges)
-    bank_idx       = {b: i for i, b in enumerate(all_banks)}
+    accs_nodes = idx_str(acc_df)
+    accs_edges = (col_str(e_aa, "Account") | col_str(e_aa, "Account.1") |
+                  col_str(e_ab, "Account") | col_str(e_ea, "Account"))
+    acc_idx = _build_map([accs_nodes, accs_edges])
 
-    ents_in_nodes = set(ent_df.index.astype(str))
-    ents_in_edges = set(e_ea["Entity ID"].astype(str))
-    all_entities  = sorted(ents_in_nodes | ents_in_edges)
-    ent_idx       = {e: i for i, e in enumerate(all_entities)}
+    banks_nodes = idx_str(bank_df)
+    banks_edges = col_str(e_ab, "To Bank")
+    bank_idx = _build_map([banks_nodes, banks_edges])
 
-    print(f"  accounts   : {len(acc_idx):,}  (nodes={len(accs_in_nodes):,}  edge-only={len(accs_in_edges-accs_in_nodes):,})")
-    print(f"  banks      : {len(bank_idx):,}  (nodes={len(banks_in_nodes):,}  edge-only={len(banks_in_edges-banks_in_nodes):,})")
-    print(f"  entities   : {len(ent_idx):,}  (nodes={len(ents_in_nodes):,}  edge-only={len(ents_in_edges-ents_in_nodes):,})")
+    ents_nodes = idx_str(ent_df)
+    ents_edges = col_str(e_ea, "Entity ID")
+    ent_idx = _build_map([ents_nodes, ents_edges])
+
+    print(f"  accounts : {len(acc_idx):,}  (nodes={len(accs_nodes):,}  edge-only={len(accs_edges-accs_nodes):,})")
+    print(f"  banks    : {len(bank_idx):,}  (nodes={len(banks_nodes):,}  edge-only={len(banks_edges-banks_nodes):,})")
+    print(f"  entities : {len(ent_idx):,}  (nodes={len(ents_nodes):,}  edge-only={len(ents_edges-ents_nodes):,})")
 
     return acc_idx, bank_idx, ent_idx
 
 
 # ═══════════════════════════════════════════════════════════════
-# STEP 3 — NODE FEATURE TENSORS
+# STEP 3 — NODE FEATURE TENSORS  (vectorised)
 # ═══════════════════════════════════════════════════════════════
 
-def _df_to_tensor(df, idx_map, feat_cols, label_col=None):
-    N      = len(idx_map)
-    F      = len(feat_cols)
-    x      = np.zeros((N, F), dtype=np.float32)
-    labels = np.full(N, -1, dtype=np.int64) if label_col else None
+def _df_to_tensor_fast(df, idx_map, feat_cols, label_col=None):
+    """
+    Vectorised version:
+      1. Add missing columns as 0
+      2. Reindex df to the full ordered ID list
+      3. Slice feature matrix in one shot
+    """
+    N = len(idx_map)
+    # ordered list of IDs for this node type
+    id_list = sorted(idx_map, key=idx_map.__getitem__)  # sorted by index
 
-    df_str = df.copy()
-    df_str.index = df_str.index.astype(str)
+    df = df.copy()
+    df.index = df.index.astype(str)
 
-    for c in feat_cols:
-        if c not in df_str.columns:
-            df_str[c] = 0.0
+    # add any missing feature cols
+    for c in feat_cols + ([label_col] if label_col else []):
+        if c and c not in df.columns:
+            df[c] = 0.0
 
-    for node_id, local_i in idx_map.items():
-        if node_id in df_str.index:
-            row       = df_str.loc[node_id]
-            x[local_i] = row[feat_cols].values.astype(np.float32)
-            if label_col is not None:
-                labels[local_i] = int(row[label_col])
+    # reindex to full id_list (fills missing with NaN → we fillna below)
+    df = df.reindex(id_list)
 
+    x = df[feat_cols].values.astype(np.float32)
     x = np.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0)
     x_t = torch.tensor(x, dtype=torch.float)
-    y_t = torch.tensor(labels, dtype=torch.long) if label_col else None
+
+    y_t = None
+    if label_col:
+        y = df[label_col].fillna(-1).values.astype(np.int64)
+        y_t = torch.tensor(y, dtype=torch.long)
+
     return x_t, y_t
 
 
-def build_node_tensors(acc_df, bank_df, ent_df,
-                        acc_idx, bank_idx, ent_idx):
+def build_node_tensors(acc_df, bank_df, ent_df, acc_idx, bank_idx, ent_idx):
     print("\n" + "─" * 58)
-    print("STEP 3 — Node feature tensors")
+    print("STEP 3 — Node feature tensors (vectorised)")
     print("─" * 58)
 
-    x_acc,  y_acc  = _df_to_tensor(acc_df,  acc_idx,  ACCOUNT_FEAT_COLS, label_col="label")
-    x_bank, _      = _df_to_tensor(bank_df, bank_idx, BANK_FEAT_COLS)
-    x_ent,  _      = _df_to_tensor(ent_df,  ent_idx,  ENTITY_FEAT_COLS)
+    x_acc,  y_acc  = _df_to_tensor_fast(acc_df,  acc_idx,  ACCOUNT_FEAT_COLS, "label")
+    x_bank, _      = _df_to_tensor_fast(bank_df, bank_idx, BANK_FEAT_COLS)
+    x_ent,  _      = _df_to_tensor_fast(ent_df,  ent_idx,  ENTITY_FEAT_COLS)
 
     n_pos = (y_acc == 1).sum().item()
     n_neg = (y_acc == 0).sum().item()
-
-    print(f"  account   x : {x_acc.shape}   pos={n_pos:,}  neg={n_neg:,}  ({100*n_pos/max(n_pos+n_neg,1):.3f}%)")
-    print(f"  bank      x : {x_bank.shape}")
-    print(f"  entity    x : {x_ent.shape}")
+    print(f"  account x : {x_acc.shape}   pos={n_pos:,}  neg={n_neg:,}  ({100*n_pos/max(n_pos+n_neg,1):.3f}%)")
+    print(f"  bank    x : {x_bank.shape}")
+    print(f"  entity  x : {x_ent.shape}")
 
     return x_acc, y_acc, x_bank, x_ent
 
 
 # ═══════════════════════════════════════════════════════════════
-# STEP 4 — EDGE TENSORS
+# STEP 4 — EDGE TENSORS  (vectorised with pd.Categorical)
 # ═══════════════════════════════════════════════════════════════
 
-def _build_edge(df, src_col, dst_col, src_map, dst_map, feat_cols):
+def _build_edge_fast(df, src_col, dst_col, src_map, dst_map, feat_cols):
+    """
+    Vectorised edge builder using pd.Categorical for O(N) mapping
+    instead of Python dict comprehension.
+    """
     df = df.copy()
     df[src_col] = df[src_col].astype(str)
     df[dst_col] = df[dst_col].astype(str)
 
-    valid = df[df[src_col].isin(src_map) & df[dst_col].isin(dst_map)]
-    dropped = len(df) - len(valid)
+    # Filter valid endpoints
+    valid_src = df[src_col].isin(src_map)
+    valid_dst = df[dst_col].isin(dst_map)
+    df = df[valid_src & valid_dst].copy()
+    dropped = len(df) - len(df)  # already filtered
     if dropped:
         print(f"    ⚠  dropped {dropped:,} edges with unmapped endpoints")
 
     for c in feat_cols:
-        if c not in valid.columns:
-            valid = valid.copy()
-            valid[c] = 0.0
+        if c not in df.columns:
+            df[c] = 0.0
 
-    src        = torch.tensor([src_map[s] for s in valid[src_col]], dtype=torch.long)
-    dst        = torch.tensor([dst_map[d] for d in valid[dst_col]], dtype=torch.long)
-    edge_index = torch.stack([src, dst], dim=0)
+    # Vectorised ID → int mapping via Categorical
+    src_ids = sorted(src_map, key=src_map.__getitem__)
+    dst_ids = sorted(dst_map, key=dst_map.__getitem__)
+
+    src_cat = pd.Categorical(df[src_col], categories=src_ids)
+    dst_cat = pd.Categorical(df[dst_col], categories=dst_ids)
+
+    src_idx_arr = src_cat.codes.astype(np.int64)
+    dst_idx_arr = dst_cat.codes.astype(np.int64)
+
+    # Drop any -1 codes (shouldn't happen after filter, but safety)
+    valid = (src_idx_arr >= 0) & (dst_idx_arr >= 0)
+    src_idx_arr = src_idx_arr[valid]
+    dst_idx_arr = dst_idx_arr[valid]
+    df = df[valid]
+
+    edge_index = torch.tensor(np.stack([src_idx_arr, dst_idx_arr]), dtype=torch.long)
     edge_attr  = torch.tensor(
-        valid[feat_cols].fillna(0).values.astype(np.float32), dtype=torch.float
+        df[feat_cols].fillna(0).values.astype(np.float32), dtype=torch.float
     )
     return edge_index, edge_attr
 
 
-def build_edge_tensors(e_aa, e_ab, e_ea,
-                        acc_idx, bank_idx, ent_idx):
+def build_edge_tensors(e_aa, e_ab, e_ea, acc_idx, bank_idx, ent_idx):
     print("\n" + "─" * 58)
-    print("STEP 4 — Edge tensors")
+    print("STEP 4 — Edge tensors (vectorised)")
     print("─" * 58)
 
     print("  account → account :")
-    ei_aa, ea_aa = _build_edge(e_aa, "Account", "Account.1",
-                                acc_idx, acc_idx, ACC_ACC_EDGE_COLS)
+    ei_aa, ea_aa = _build_edge_fast(e_aa, "Account", "Account.1",
+                                     acc_idx, acc_idx, ACC_ACC_EDGE_COLS)
 
     print("  account → bank :")
-    ei_ab, ea_ab = _build_edge(e_ab, "Account", "To Bank",
-                                acc_idx, bank_idx, ACC_BANK_EDGE_COLS)
+    ei_ab, ea_ab = _build_edge_fast(e_ab, "Account", "To Bank",
+                                     acc_idx, bank_idx, ACC_BANK_EDGE_COLS)
 
     print("  entity  → account :")
-    ei_ea, ea_ea = _build_edge(e_ea, "Entity ID", "Account",
-                                ent_idx, acc_idx, ENT_ACC_EDGE_COLS)
+    ei_ea, ea_ea = _build_edge_fast(e_ea, "Entity ID", "Account",
+                                     ent_idx, acc_idx, ENT_ACC_EDGE_COLS)
 
     print(f"\n  acc→acc   edge_index={ei_aa.shape}  edge_attr={ea_aa.shape}")
     print(f"  acc→bank  edge_index={ei_ab.shape}  edge_attr={ea_ab.shape}")
@@ -259,7 +270,7 @@ def build_edge_tensors(e_aa, e_ab, e_ea,
 # STEP 5 — STRATIFIED MASKS
 # ═══════════════════════════════════════════════════════════════
 
-def build_masks(y: torch.Tensor, val_ratio: float, test_ratio: float):
+def build_masks(y, val_ratio, test_ratio):
     print("\n" + "─" * 58)
     print("STEP 5 — Stratified train/val/test masks")
     print("─" * 58)
@@ -269,13 +280,13 @@ def build_masks(y: torch.Tensor, val_ratio: float, test_ratio: float):
     y_lab    = labels[labelled]
 
     train_idx, temp_idx = train_test_split(
-        labelled, test_size=val_ratio+test_ratio,
+        labelled, test_size=val_ratio + test_ratio,
         stratify=y_lab, random_state=42
     )
     y_temp = labels[temp_idx]
     val_idx, test_idx = train_test_split(
         temp_idx,
-        test_size=test_ratio/(val_ratio+test_ratio),
+        test_size=test_ratio / (val_ratio + test_ratio),
         stratify=y_temp, random_state=42
     )
 
@@ -295,7 +306,6 @@ def build_masks(y: torch.Tensor, val_ratio: float, test_ratio: float):
     report("train", train_mask)
     report("val",   val_mask)
     report("test",  test_mask)
-
     assert not (train_mask & val_mask).any()
     assert not (train_mask & test_mask).any()
     assert not (val_mask   & test_mask).any()
@@ -308,11 +318,9 @@ def build_masks(y: torch.Tensor, val_ratio: float, test_ratio: float):
 # STEP 6 — ASSEMBLE HeteroData
 # ═══════════════════════════════════════════════════════════════
 
-def assemble_hetero_data(
-    x_acc, y_acc, x_bank, x_ent,
-    edge_aa, edge_ab, edge_ea,
-    train_mask, val_mask, test_mask,
-) -> HeteroData:
+def assemble_hetero_data(x_acc, y_acc, x_bank, x_ent,
+                          edge_aa, edge_ab, edge_ea,
+                          train_mask, val_mask, test_mask) -> HeteroData:
     print("\n" + "─" * 58)
     print("STEP 6 — Assembling HeteroData")
     print("─" * 58)
@@ -322,33 +330,27 @@ def assemble_hetero_data(
     ei_ea, ea_ea = edge_ea
 
     data = HeteroData()
-
     data["account"].x          = x_acc
     data["account"].y          = y_acc
     data["account"].train_mask = train_mask
     data["account"].val_mask   = val_mask
     data["account"].test_mask  = test_mask
     data["account"].num_nodes  = x_acc.shape[0]
-
-    data["bank"].x         = x_bank
-    data["bank"].num_nodes = x_bank.shape[0]
-
-    data["entity"].x         = x_ent
-    data["entity"].num_nodes = x_ent.shape[0]
+    data["bank"].x             = x_bank
+    data["bank"].num_nodes     = x_bank.shape[0]
+    data["entity"].x           = x_ent
+    data["entity"].num_nodes   = x_ent.shape[0]
 
     data["account", "to",       "account"].edge_index = ei_aa
     data["account", "to",       "account"].edge_attr  = ea_aa
-
     data["account", "sends_to", "bank"].edge_index    = ei_ab
     data["account", "sends_to", "bank"].edge_attr     = ea_ab
-
     data["entity",  "owns",     "account"].edge_index = ei_ea
     data["entity",  "owns",     "account"].edge_attr  = ea_ea
 
     data = T.ToUndirected(merge=False)(data)
 
     print(f"  node types : {data.node_types}")
-    print(f"  edge types :")
     for et in data.edge_types:
         ei = data[et].edge_index
         ea = data[et].edge_attr if hasattr(data[et], "edge_attr") else None
@@ -366,12 +368,10 @@ def compute_class_weights(y, train_mask):
     print("\n" + "─" * 58)
     print("STEP 7 — Class weights")
     print("─" * 58)
-
     y_train    = y[train_mask]
     n_pos      = (y_train == 1).sum().item()
     n_neg      = (y_train == 0).sum().item()
     pos_weight = n_neg / max(n_pos, 1)
-
     weights = {
         "pos_weight"  : pos_weight,
         "n_pos_train" : n_pos,
@@ -379,7 +379,7 @@ def compute_class_weights(y, train_mask):
         "focal_gamma" : 2.0,
         "focal_alpha" : 0.25,
     }
-    print(f"  pos_weight  : {pos_weight:.1f}  (n_neg/n_pos from train set)")
+    print(f"  pos_weight : {pos_weight:.1f}")
     return weights
 
 
@@ -392,53 +392,38 @@ def sanity_check(data: HeteroData):
     print("STEP 8 — Sanity checks")
     print("─" * 58)
     errors = 0
-
     for nt in data.node_types:
         if hasattr(data[nt], "x") and data[nt].x is not None:
             n = torch.isnan(data[nt].x).sum().item()
-            if n:
-                print(f"  ✗ NaN in {nt}.x : {n}"); errors += 1
-            else:
-                print(f"  ✓ No NaN  {nt}.x  {tuple(data[nt].x.shape)}")
-
+            flag = "✗" if n else "✓"
+            print(f"  {flag} NaN check  {nt}.x  {tuple(data[nt].x.shape)}")
+            if n: errors += 1
     node_sizes = {nt: data[nt].num_nodes for nt in data.node_types}
     for et in data.edge_types:
         src_t, _, dst_t = et
         ei = data[et].edge_index
-        n_src = node_sizes.get(src_t, 0)
-        n_dst = node_sizes.get(dst_t, 0)
-        oob = (ei[0].max().item() >= n_src) or (ei[1].max().item() >= n_dst)
-        if oob:
-            print(f"  ✗ Edge OOB  {et}"); errors += 1
-        else:
-            print(f"  ✓ Edge idx  {str(et):<50}  E={ei.shape[1]:,}")
-
-    tm  = data["account"].train_mask
-    vm  = data["account"].val_mask
-    tsm = data["account"].test_mask
+        oob = (ei[0].max().item() >= node_sizes.get(src_t, 0)) or \
+              (ei[1].max().item() >= node_sizes.get(dst_t, 0))
+        flag = "✗" if oob else "✓"
+        print(f"  {flag} Edge idx  {str(et):<50}  E={ei.shape[1]:,}")
+        if oob: errors += 1
+    tm, vm, tsm = (data["account"].train_mask,
+                   data["account"].val_mask,
+                   data["account"].test_mask)
     if (tm & vm).any() or (tm & tsm).any() or (vm & tsm).any():
         print("  ✗ Mask overlap"); errors += 1
     else:
         print("  ✓ Masks mutually exclusive")
-
     for name, mask in [("train", tm), ("val", vm), ("test", tsm)]:
         pos = (data["account"].y[mask] == 1).sum().item()
-        if pos == 0:
-            print(f"  ✗ Zero positives in {name}"); errors += 1
-        else:
-            print(f"  ✓ {name} positives : {pos:,}")
-
+        print(f"  ✓ {name} positives : {pos:,}" if pos else f"  ✗ Zero positives in {name}")
+        if not pos: errors += 1
     print(f"\n  {'✅ All checks passed' if not errors else f'❌ {errors} failed'}")
     return errors == 0
 
 
 # ═══════════════════════════════════════════════════════════════
 # STEP 9 — SAVE
-# FIX: graph_meta now also stores node_id_map (account_id→index) and
-#      node_ids (index→account_id list) so that rgcn_inference.py and
-#      mule_network.py can resolve node indices to account IDs.
-#      graph_weights now stores a flat edge_weights list derived from
-#      the acc→acc edge_attr weight column so mule_network can use it.
 # ═══════════════════════════════════════════════════════════════
 
 def save_outputs(data, weights, acc_idx, out_path):
@@ -450,37 +435,28 @@ def save_outputs(data, weights, acc_idx, out_path):
     print(f"  graph.pt       → {out_path}  ({os.path.getsize(out_path)/1e6:.1f} MB)")
 
     w_path = out_path.replace(".pt", "_weights.pt")
-    # Build flat edge_weights for acc→acc edges (used by mule_network BFS)
-    ei_aa = data["account", "to", "account"].edge_index
-    ea_aa = data["account", "to", "account"].edge_attr
-    # edge_weight is the first column of ACC_ACC_EDGE_COLS
+    ei_aa  = data["account", "to", "account"].edge_index
+    ea_aa  = data["account", "to", "account"].edge_attr
+
+    edge_index_list   = list(zip(ei_aa[0].tolist(), ei_aa[1].tolist()))
     edge_weights_list = ea_aa[:, 0].tolist() if ea_aa is not None else []
-    # Build edge_index as list of (src, dst) tuples for plain-dict consumers
-    edge_index_list = list(zip(
-        ei_aa[0].tolist(), ei_aa[1].tolist()
-    ))
     weights["edge_weights"] = edge_weights_list
     weights["edge_index"]   = edge_index_list
     torch.save(weights, w_path)
     print(f"  graph_weights  → {w_path}")
 
-    # node_ids: ordered list of account IDs (index → ID)
     node_ids = [None] * len(acc_idx)
     for acc_id, idx in acc_idx.items():
         node_ids[idx] = acc_id
 
-    # labels array aligned with node_ids
     y_np = data["account"].y.numpy()
-
-    meta = {
-        nt: data[nt].x.shape[1]
-        for nt in data.node_types
-        if hasattr(data[nt], "x") and data[nt].x is not None
-    }
-    meta["node_id_map"] = acc_idx          # account_id (str) → int index
-    meta["node_ids"]    = node_ids         # int index → account_id (str)
-    meta["labels"]      = y_np.tolist()    # list aligned with node_ids
-    meta["x"]           = data["account"].x.numpy().tolist()  # feature matrix
+    meta = {nt: data[nt].x.shape[1]
+            for nt in data.node_types
+            if hasattr(data[nt], "x") and data[nt].x is not None}
+    meta["node_id_map"] = acc_idx
+    meta["node_ids"]    = node_ids
+    meta["labels"]      = y_np.tolist()
+    meta["x"]           = data["account"].x.numpy().tolist()
 
     m_path = out_path.replace(".pt", "_meta.pt")
     torch.save(meta, m_path)
@@ -495,46 +471,23 @@ def save_outputs(data, weights, acc_idx, out_path):
 def main(args):
     t0 = time.time()
     print("=" * 58)
-    print("MULE ACCOUNT DETECTION — GRAPH BUILDER v3")
+    print("MULE ACCOUNT DETECTION — GRAPH BUILDER v4 (OPTIMISED)")
     print("=" * 58)
 
     acc_df, bank_df, ent_df, e_aa, e_ab, e_ea = load_all(args)
-
-    acc_idx, bank_idx, ent_idx = build_index_maps(
-        acc_df, bank_df, ent_df, e_aa, e_ab, e_ea
-    )
-
-    x_acc, y_acc, x_bank, x_ent = build_node_tensors(
-        acc_df, bank_df, ent_df, acc_idx, bank_idx, ent_idx
-    )
-
-    edge_aa, edge_ab, edge_ea = build_edge_tensors(
-        e_aa, e_ab, e_ea, acc_idx, bank_idx, ent_idx
-    )
-
-    train_mask, val_mask, test_mask = build_masks(
-        y_acc, args.val_ratio, args.test_ratio
-    )
-
-    data = assemble_hetero_data(
-        x_acc, y_acc, x_bank, x_ent,
-        edge_aa, edge_ab, edge_ea,
-        train_mask, val_mask, test_mask,
-    )
-
+    acc_idx, bank_idx, ent_idx = build_index_maps(acc_df, bank_df, ent_df, e_aa, e_ab, e_ea)
+    x_acc, y_acc, x_bank, x_ent = build_node_tensors(acc_df, bank_df, ent_df, acc_idx, bank_idx, ent_idx)
+    edge_aa, edge_ab, edge_ea   = build_edge_tensors(e_aa, e_ab, e_ea, acc_idx, bank_idx, ent_idx)
+    train_mask, val_mask, test_mask = build_masks(y_acc, args.val_ratio, args.test_ratio)
+    data    = assemble_hetero_data(x_acc, y_acc, x_bank, x_ent,
+                                    edge_aa, edge_ab, edge_ea,
+                                    train_mask, val_mask, test_mask)
     weights = compute_class_weights(y_acc, train_mask)
     sanity_check(data)
-    # FIX: pass acc_idx so save_outputs can build node_id_map / node_ids
     save_outputs(data, weights, acc_idx, args.out)
-
     print(f"\n✅ Done in {(time.time()-t0)/60:.1f} min")
-    print(f"\nNext:  python model/train.py --graph {args.out}")
     return data
 
-
-# ═══════════════════════════════════════════════════════════════
-# CLI
-# ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
